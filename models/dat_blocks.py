@@ -26,6 +26,7 @@ class LocalAttention(nn.Module):
 
         self.proj_qkv = nn.Linear(dim, 3 * dim)
         self.heads = heads
+        # dim必须可以被heads整除
         assert dim % heads == 0
         head_dim = dim // heads
         self.scale = head_dim ** -0.5
@@ -35,21 +36,36 @@ class LocalAttention(nn.Module):
         self.attn_drop = nn.Dropout(attn_drop, inplace=True)
 
         Wh, Ww = self.window_size
+        # 相对位置偏置表，每个头上都有一个
         self.relative_position_bias_table = nn.Parameter(
             torch.zeros((2 * Wh - 1) * (2 * Ww - 1), heads)
         )
+        # 将relative_position_bias_table初始化为均值为0，方差为0.01的正态分布
         trunc_normal_(self.relative_position_bias_table, std=0.01)
 
+        '''
+        下面是为了生成相对位置偏置表的一维地址偏移
+        '''
+        # 生成一个 [0, end)，step = 1 的张量
         coords_h = torch.arange(self.window_size[0])
         coords_w = torch.arange(self.window_size[1])
+        # 相互沿另一方的维度进行复制，生成两个同样大小的网格
         coords = torch.stack(torch.meshgrid([coords_h, coords_w], indexing='ij'))  # 2, Wh, Ww
         coords_flatten = torch.flatten(coords, 1)  # 2, Wh*Ww
+        # [:, :, None]在最后添加一个维度，变成 (2, Wh * Ww, 1)，另一个类似有(2, 1, Wh * Ww)，然后广播相减
+        # 由于这里做了减法，坐标会变成 [-Wh + 1, Wh - 1], [-Ww + 1, Ww - 1]
         relative_coords = coords_flatten[:, :, None] - coords_flatten[:, None, :]  # 2, Wh*Ww, Wh*Ww
+        # 调整一下维度顺序
         relative_coords = relative_coords.permute(1, 2, 0).contiguous()  # Wh*Ww, Wh*Ww, 2
+        # 将偏置调整为从0开始，即由 [-Wh + 1, Wh - 1] 变成 [0, 2 * Wh - 2]
         relative_coords[:, :, 0] += self.window_size[0] - 1  # shift to start from 0
         relative_coords[:, :, 1] += self.window_size[1] - 1
+        # 然后(row - 1) * col，得到行地址偏移
         relative_coords[:, :, 0] *= 2 * self.window_size[1] - 1
+        # 最后加上列地址偏移，得到总偏移
         relative_position_index = relative_coords.sum(-1)  # Wh*Ww, Wh*Ww
+
+        # 希望模型中的某些参数参数不更新（从开始到结束均保持不变），但又希望参数保存下来 model.state_dict()，就会用到 register_buffer()
         self.register_buffer("relative_position_index", relative_position_index)
 
     def forward(self, x, mask=None):
@@ -57,35 +73,51 @@ class LocalAttention(nn.Module):
         B, C, H, W = x.size()
         r1, r2 = H // self.window_size[0], W // self.window_size[1]
 
-        x_total = einops.rearrange(x, 'b c (r1 h1) (r2 w1) -> b (r1 r2) (h1 w1) c', h1=self.window_size[0], w1=self.window_size[1]) # B x Nr x Ws x C
-
+        # B x Nr x Ws x C
+        x_total = einops.rearrange(x, 'b c (r1 h1) (r2 w1) -> b (r1 r2) (h1 w1) c', h1=self.window_size[0], w1=self.window_size[1]) 
+        
+        # (B, m=r1*r2) 结合就是总的窗口个数 -> (all, Wh*Ww, C)
         x_total = einops.rearrange(x_total, 'b m n c -> (b m) n c')
-
-        qkv = self.proj_qkv(x_total) # B' x N x 3C
+        # (all, Wh*Ww,  3*C)
+        qkv = self.proj_qkv(x_total)
+        # 将投影结果切分成qkv
         q, k, v = torch.chunk(qkv, 3, dim=2)
 
         q = q * self.scale
+        # 将 q k v拆分成多个头   (all, n_head, Wh*Ww, C / n_head = c)
         q, k, v = [einops.rearrange(t, 'b n (h c1) -> b h n c1', h=self.heads) for t in [q, k, v]]
+        # (all, n_head, Wh*Ww, Wh*Ww)
         attn = torch.einsum('b h m c, b h n c -> b h m n', q, k)
-
+        '''
+            self.relative_position_index.view(-1) 是一个一维展开   Wh*Ww * Wh*Ww
+            然后从 self.relative_position_bias_table 取出对应的元素
+            然后再 view成 (Wh*Ww, Wh*Ww, n_head)的形状
+        '''
         relative_position_bias = self.relative_position_bias_table[self.relative_position_index.view(-1)].view(
             self.window_size[0] * self.window_size[1], self.window_size[0] * self.window_size[1], -1)  # Wh*Ww,Wh*Ww,nH
+        # 调换一下维度顺序
         relative_position_bias = relative_position_bias.permute(2, 0, 1).contiguous()  # nH, Wh*Ww, Wh*Ww
         attn_bias = relative_position_bias
+        # attn: (all, n_head, Wh*Ww, Wh*Ww)
+        # attn_bias: (n_head, Wh*Ww, Wh*Ww) -> (1, n_head, Wh*Ww, Wh*Ww)
         attn = attn + attn_bias.unsqueeze(0)
 
+        # 如果有mask需要对应加上
         if mask is not None:
-            # attn : (b * nW) h w w
-            # mask : nW ww ww
+            # attn : (B * r1 * r2, n_head, Wh*Ww, Wh*Ww)
+            # mask : (r1 * r2, Wh*Ww, Wh*Ww)
             nW, ww, _ = mask.size()
             attn = einops.rearrange(attn, '(b n) h w1 w2 -> b n h w1 w2', n=nW, h=self.heads, w1=ww, w2=ww) + mask.reshape(1, nW, 1, ww, ww)
             attn = einops.rearrange(attn, 'b n h w1 w2 -> (b n) h w1 w2')
+        # 带Dropout的softmax
         attn = self.attn_drop(attn.softmax(dim=3))
-
+        # (all, n_head, Wh*Ww, Wh*Ww) -> (all, n_head, Wh*Ww, c)
         x = torch.einsum('b h m n, b h n c -> b h m c', attn, v)
+        # 将多头的结果concat (all, n_head, Wh*Ww, c) -> (all, Wh * Ww, C)
         x = einops.rearrange(x, 'b h n c1 -> b n (h c1)')
-        x = self.proj_drop(self.proj_out(x)) # B' x N x C
-        x = einops.rearrange(x, '(b r1 r2) (h1 w1) c -> b c (r1 h1) (r2 w1)', r1=r1, r2=r2, h1=self.window_size[0], w1=self.window_size[1]) # B x C x H x W
+        x = self.proj_drop(self.proj_out(x)) # (all, Wh * Ww, C)
+        # (B * r1 * r2, Wh * Ww, C) -> (B, C, H, W)
+        x = einops.rearrange(x, '(b r1 r2) (h1 w1) c -> b c (r1 h1) (r2 w1)', r1=r1, r2=r2, h1=self.window_size[0], w1=self.window_size[1]) 
 
         return x, None, None
 
@@ -126,8 +158,15 @@ class ShiftWindowAttention(LocalAttention):
 
         return x, None, None
     
-
+# Deformable Attention
 class DAttentionBaseline(nn.Module):
+
+    '''
+        DAttentionBaseline(fmap_size, fmap_size, heads, 
+                    hc, n_groups, attn_drop, proj_drop, 
+                    stride, offset_range_factor, use_pe, dwc_pe, 
+                    no_off, fixed_pe, ksize, log_cpb)
+    '''
 
     def __init__(
         self, q_size, kv_size, n_heads, n_head_channels, n_groups,
@@ -146,7 +185,9 @@ class DAttentionBaseline(nn.Module):
         self.kv_h, self.kv_w = self.q_h // stride, self.q_w // stride
         self.nc = n_head_channels * n_heads
         self.n_groups = n_groups
+        # 每个组的通道数
         self.n_group_channels = self.nc // self.n_groups
+        # 每个组的头数
         self.n_group_heads = self.n_heads // self.n_groups
         self.use_pe = use_pe
         self.fixed_pe = fixed_pe
@@ -158,6 +199,13 @@ class DAttentionBaseline(nn.Module):
         kk = self.ksize
         pad_size = kk // 2 if kk != stride else 0
 
+        '''
+            torch.nn.Conv2d(in_channels, out_channels, kernel_size, stride=1, padding=0, dilation=1, 
+                            groups=1, bias=True, padding_mode='zeros', device=None, dtype=None)
+
+            At groups= in_channels, each input channel is convolved with its own set of filters
+        '''
+
         self.conv_offset = nn.Sequential(
             nn.Conv2d(self.n_group_channels, self.n_group_channels, kk, stride, pad_size, groups=self.n_group_channels),
             LayerNormProxy(self.n_group_channels),
@@ -168,6 +216,10 @@ class DAttentionBaseline(nn.Module):
             for m in self.conv_offset.parameters():
                 m.requires_grad_(False)
 
+        '''
+            kqv投影层都是卷积核大小为1的卷积，以及proj_out
+            并且输入输出通道都是 n_head_channels * n_heads
+        '''
         self.proj_q = nn.Conv2d(
             self.nc, self.nc,
             kernel_size=1, stride=1, padding=0
@@ -182,7 +234,7 @@ class DAttentionBaseline(nn.Module):
             self.nc, self.nc,
             kernel_size=1, stride=1, padding=0
         )
-
+        
         self.proj_out = nn.Conv2d(
             self.nc, self.nc,
             kernel_size=1, stride=1, padding=0
@@ -215,10 +267,12 @@ class DAttentionBaseline(nn.Module):
         else:
             self.rpe_table = None
 
+    # 获取参照点
     @torch.no_grad()
     def _get_ref_points(self, H_key, W_key, B, dtype, device):
 
         ref_y, ref_x = torch.meshgrid(
+            # [0.5, 1.5, ..., H_key - 0.5]
             torch.linspace(0.5, H_key - 0.5, H_key, dtype=dtype, device=device),
             torch.linspace(0.5, W_key - 0.5, W_key, dtype=dtype, device=device),
             indexing='ij'
@@ -252,6 +306,7 @@ class DAttentionBaseline(nn.Module):
 
         q = self.proj_q(x)
         q_off = einops.rearrange(q, 'b (g c) h w -> (b g) c h w', g=self.n_groups, c=self.n_group_channels)
+        # 经过conv_offset -> (b * g, 2, h, w)
         offset = self.conv_offset(q_off).contiguous()  # B * g 2 Hg Wg
         Hk, Wk = offset.size(2), offset.size(3)
         n_sample = Hk * Wk
@@ -410,15 +465,17 @@ class TransformerMLP(nn.Module):
         x = einops.rearrange(x, 'b (h w) c -> b c h w', h=H, w=W)
         return x
 
+
 class LayerNormProxy(nn.Module):
     
     def __init__(self, dim):
         
         super().__init__()
+        # 这里只想对每个特征图的特征做 layernorm
         self.norm = nn.LayerNorm(dim)
 
     def forward(self, x):
-
+        # 因此需要rearrange
         x = einops.rearrange(x, 'b c h w -> b h w c')
         x = self.norm(x)
         return einops.rearrange(x, 'b h w c -> b c h w')

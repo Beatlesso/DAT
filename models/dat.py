@@ -39,6 +39,22 @@ class LayerScale(nn.Module):
 
 class TransformerStage(nn.Module):
 
+    '''
+        TransformerStage(
+                    img_size, window_sizes[i], ns_per_pts[i],
+                    dim1, dim2, depths[i],
+                    stage_spec[i], groups[i], use_pes[i],
+                    sr_ratios[i], heads[i], heads_q[i], strides[i],
+                    offset_range_factor[i],
+                    dwc_pes[i], no_offs[i], fixed_pes[i],
+                    attn_drop_rate, drop_rate, expansion, drop_rate,
+                    dpr[sum(depths[:i]):sum(depths[:i + 1])], use_dwc_mlps[i],
+                    ksizes[i], nat_ksizes[i], ksize_qnas[i], nqs[i],qna_activation,
+                    layer_scale_values[i], use_lpus[i], log_cpb[i]
+                )
+    '''
+
+
     def __init__(self, fmap_size, window_size, ns_per_pt,
                  dim_in, dim_embed, depths, stage_spec, n_groups, 
                  use_pe, sr_ratio,
@@ -168,7 +184,8 @@ class DAT(nn.Module):
                  drop_rate=0.0, attn_drop_rate=0.0, drop_path_rate=0.0, 
                  strides=[-1,-1,-1,-1],
                  offset_range_factor=[1, 2, 3, 4],
-                 stage_spec=[['L', 'D'], ['L', 'D'], ['L', 'D', 'L', 'D', 'L', 'D'], ['L', 'D']], 
+                 # 可以看到都是 L 和 D 交替出现，这两个注意力实现都在 dat_blocks 里面
+                 stage_spec=[['L', 'D'], ['L', 'D'], ['L', 'D', 'L', 'D', 'L', 'D'], ['L', 'D']],  
                  groups=[-1, -1, 3, 6],
                  use_pes=[False, False, False, False], 
                  dwc_pes=[False, False, False, False],
@@ -191,6 +208,8 @@ class DAT(nn.Module):
         super().__init__()
 
         self.patch_proj = nn.Sequential(
+            # torch.nn.Conv2d(in_channels, out_channels, kernel_size, stride=1, padding=0, dilation=1, 
+            #                 groups=1, bias=True, padding_mode='zeros', device=None, dtype=None)
             nn.Conv2d(3, dim_stem // 2, 3, patch_size // 2, 1),
             LayerNormProxy(dim_stem // 2),
             nn.GELU(),
@@ -202,6 +221,7 @@ class DAT(nn.Module):
         )
 
         img_size = img_size // patch_size
+        # torch.linspace 从start 到 end, 创建大小为steps的等差张量
         dpr = [x.item() for x in torch.linspace(0, drop_path_rate, sum(depths))]
 
         self.stages = nn.ModuleList()
@@ -303,12 +323,16 @@ class DAT(nn.Module):
 
     def forward(self, x):
         x = self.patch_proj(x)
+        # 分多个阶段，只要不是第四个阶段，就需要在后面进行下采样
         for i in range(4):
             x = self.stages[i](x)
             if i < 3:
                 x = self.down_projs[i](x)
+        # 只对channel进行layernorm
         x = self.cls_norm(x)
+        # 自适应平均池化，最后两维变成 1, 1
         x = F.adaptive_avg_pool2d(x, 1)
+        # 将后面的维度都展开，然后通过分类线性层
         x = torch.flatten(x, 1)
         x = self.cls_head(x)
         return x, None, None
